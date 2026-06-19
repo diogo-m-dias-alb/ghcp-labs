@@ -1,0 +1,135 @@
+# docker-compose.yml
+# Production-ready multi-service setup for the reminder engine + PostgreSQL.
+# Notes:
+# - Uses health checks and dependency conditions for safer startup ordering.
+# - Uses required environment variable checks to fail fast on bad configuration.
+# - Uses named volumes for persistent data.
+
+services:
+  # Python application service running the reminder engine.
+  reminder-engine:
+    image: python:3.12-slim
+    container_name: reminder-engine
+
+    # Ensure child processes are reaped correctly (better signal handling in production).
+    init: true
+
+    # Start only after PostgreSQL is healthy.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Restart on failures to improve resiliency.
+    restart: on-failure:5
+    stop_grace_period: 30s
+
+    # Application configuration and database connection settings.
+    environment:
+      # App runtime settings
+      APP_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REMINDER_PORT: ${REMINDER_PORT:-8000}
+
+      # Database connection settings consumed by the reminder engine
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-reminders}
+      DB_USER: ${POSTGRES_USER:-reminder_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+
+      # Optional full DSN if your app prefers a single connection string
+      DATABASE_URL: postgresql://${POSTGRES_USER:-reminder_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-reminders}
+
+    # Mount source read-only and mount a writable data directory for app state/artifacts.
+    volumes:
+      - ./:/app:ro
+      - reminder_data:/var/lib/reminder-engine
+
+    working_dir: /app
+
+    # Fails fast if dependency install or startup fails.
+    # Replace module path if your entrypoint differs.
+    command: >-
+      sh -ec "
+      python -m pip install --no-cache-dir -r requirements.txt &&
+      exec python -m reminder_engine
+      "
+
+    # Expose service port to host (optional in production behind reverse proxy).
+    ports:
+      - "${REMINDER_PORT:-8000}:8000"
+
+    # Health check validates app listener on localhost:8000.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 8000)); s.close(); sys.exit(0)\""
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    # Attach service to the dedicated bridge network.
+    networks:
+      - reminder-net
+
+    # Basic log rotation to avoid unbounded disk growth.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # PostgreSQL database service for reminder persistence.
+  postgres:
+    image: postgres:16-alpine
+    container_name: reminder-postgres
+
+    # Keep DB available and resilient.
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+    # PostgreSQL initialization settings.
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reminders}
+      POSTGRES_USER: ${POSTGRES_USER:-reminder_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+
+    # Persistent storage for PostgreSQL data files.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Health check ensures DB is ready before app starts.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-reminder_user} -d ${POSTGRES_DB:-reminders} -h 127.0.0.1 -p 5432"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    # Do not expose DB externally unless needed; keep traffic internal to network.
+    expose:
+      - "5432"
+
+    # Attach service to the dedicated bridge network.
+    networks:
+      - reminder-net
+
+# Named volumes provide durable storage across container restarts/recreates.
+volumes:
+  postgres_data:
+    name: reminder_postgres_data
+  reminder_data:
+    name: reminder_engine_data
+
+# Custom bridge network for isolated service-to-service communication.
+networks:
+  reminder-net:
+    name: reminder_bridge_network
+    driver: bridge
